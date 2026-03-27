@@ -16,6 +16,13 @@ def parse_pattern(pattern: str):
         return None
 
 
+def parse_date_safe(value, default_date):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return default_date
+
+
 def is_employee_available(employee, target_date, rest_days_map):
     employee_id = employee.get("id")
     weekly_pattern = (employee.get("weekly_pattern") or "").strip()
@@ -61,6 +68,9 @@ def employee_matches_role(employee, department, role):
     if employee_department != target_department:
         return False, None
 
+    if not target_role:
+        return True, "main"
+
     if main_role == target_role:
         return True, "main"
 
@@ -70,67 +80,125 @@ def employee_matches_role(employee, department, role):
     return False, None
 
 
-def build_team_map(teams):
+def get_employee_team_id(employee, team_map):
+    return team_map.get(employee.get("id")) or employee.get("team_id") or ""
+
+
+def build_team_map(teams, employees):
     team_map = {}
+
     for team in teams:
         team_id = team.get("id")
         for member_id in team.get("member_ids", []):
-            team_map[member_id] = team_id
+            if team_id and member_id:
+                team_map[member_id] = team_id
+
+    for employee in employees:
+        emp_id = employee.get("id")
+        employee_team_id = employee.get("team_id")
+        if emp_id and employee_team_id and emp_id not in team_map:
+            team_map[emp_id] = employee_team_id
+
     return team_map
 
 
-def get_active_rules(data):
-    rules = {
-        "use_teams": True,
-        "respect_roles_and_staffing": True,
-        "respect_rest_days": True
-    }
+def group_candidates_by_team(candidates, team_map):
+    grouped = {}
+    no_team = []
 
-    raw_rules = data.get("generator_rules", [])
-    if isinstance(raw_rules, list):
-        for rule in raw_rules:
-            name = (rule.get("name") or "").strip().lower()
-            active = bool(rule.get("is_active", False))
+    for employee, source_role_type in candidates:
+        team_id = get_employee_team_id(employee, team_map)
+        if team_id:
+            grouped.setdefault(team_id, []).append((employee, source_role_type))
+        else:
+            no_team.append((employee, source_role_type))
 
-            if "echipe" in name:
-                rules["use_teams"] = active
-            elif "roluri" in name or "necesar" in name:
-                rules["respect_roles_and_staffing"] = active
-            elif "zile libere" in name or "odihn" in name:
-                rules["respect_rest_days"] = active
-
-    return rules
+    return grouped, no_team
 
 
-def is_on_leave(emp_id, current_date, leave_map):
-    return current_date in leave_map.get(emp_id, set())
+def sort_candidate_pool(candidate_pool, employee_assignment_count):
+    return sorted(candidate_pool, key=lambda item: (
+        0 if item[1] == "main" else 1,
+        employee_assignment_count.get(item[0].get("id"), 0),
+        (item[0].get("full_name") or "").strip().lower(),
+        item[0].get("id") or ""
+    ))
 
 
-def can_work(employee, current_date, rest_days_map, leave_map, rules):
-    emp_id = employee.get("id")
+def pick_best_candidates_for_requirement(
+    primary_candidates,
+    secondary_candidates,
+    required_staff,
+    team_daily_usage,
+    team_map,
+    employee_assignment_count
+):
+    selected = []
 
-    if is_on_leave(emp_id, current_date, leave_map):
-        return False
+    primary_candidates = sort_candidate_pool(primary_candidates, employee_assignment_count)
+    secondary_candidates = sort_candidate_pool(secondary_candidates, employee_assignment_count)
 
-    if rules["respect_rest_days"]:
-        if not is_employee_available(employee, current_date, rest_days_map):
-            return False
+    primary_by_team, primary_without_team = group_candidates_by_team(primary_candidates, team_map)
+    secondary_by_team, secondary_without_team = group_candidates_by_team(secondary_candidates, team_map)
 
-    return True
+    ordered_primary_teams = sorted(
+        primary_by_team.items(),
+        key=lambda item: (
+            team_daily_usage.get(item[0], 0),
+            -len(item[1]),
+            item[0]
+        )
+    )
 
+    for team_id, members in ordered_primary_teams:
+        if len(selected) >= required_staff:
+            break
+        for employee, source_role_type in members:
+            if len(selected) >= required_staff:
+                break
+            if any(existing[0].get("id") == employee.get("id") for existing in selected):
+                continue
+            selected.append((employee, source_role_type))
+            team_daily_usage[team_id] = team_daily_usage.get(team_id, 0) + 1
 
-def create_assignment(employee, department, role, shift_type, team_map):
-    emp_id = employee.get("id")
-    return {
-        "employee_id": emp_id,
-        "employee_name": employee.get("full_name", ""),
-        "department": department,
-        "role": role,
-        "shift_type": shift_type,
-        "start_time": "09:00",
-        "end_time": "18:00",
-        "team_id": team_map.get(emp_id, "")
-    }
+    if len(selected) < required_staff:
+        for employee, source_role_type in primary_without_team:
+            if len(selected) >= required_staff:
+                break
+            if any(existing[0].get("id") == employee.get("id") for existing in selected):
+                continue
+            selected.append((employee, source_role_type))
+
+    if len(selected) < required_staff:
+        ordered_secondary_teams = sorted(
+            secondary_by_team.items(),
+            key=lambda item: (
+                team_daily_usage.get(item[0], 0),
+                -len(item[1]),
+                item[0]
+            )
+        )
+
+        for team_id, members in ordered_secondary_teams:
+            if len(selected) >= required_staff:
+                break
+            for employee, source_role_type in members:
+                if len(selected) >= required_staff:
+                    break
+                if any(existing[0].get("id") == employee.get("id") for existing in selected):
+                    continue
+                selected.append((employee, source_role_type))
+                team_daily_usage[team_id] = team_daily_usage.get(team_id, 0) + 1
+
+    if len(selected) < required_staff:
+        for employee, source_role_type in secondary_without_team:
+            if len(selected) >= required_staff:
+                break
+            if any(existing[0].get("id") == employee.get("id") for existing in selected):
+                continue
+            selected.append((employee, source_role_type))
+
+    return selected[:required_staff]
 
 
 @app.get("/")
@@ -146,48 +214,39 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
     start_date = datetime.strptime(data["start_date"], "%Y-%m-%d").date()
     end_date = datetime.strptime(data["end_date"], "%Y-%m-%d").date()
 
-    employees = [
-        e for e in data.get("employees", [])
-        if (e.get("status") or "").strip().lower() == "activ"
-    ]
+    employees = [e for e in data.get("employees", []) if (e.get("status") or "").lower() == "activ"]
     teams = data.get("teams", [])
     employee_rest_days = data.get("employee_rest_days", [])
     employee_leaves = data.get("employee_leaves", [])
     daily_staffing_requirements = data.get("daily_staffing_requirements", [])
 
-    rules = get_active_rules(data)
-
-    rest_days_map = {item["employee_id"]: item for item in employee_rest_days}
-    team_map = build_team_map(teams)
+    rest_days_map = {item["employee_id"]: item for item in employee_rest_days if item.get("employee_id")}
 
     leave_map = {}
     for leave in employee_leaves:
         emp_id = leave.get("employee_id")
         if not emp_id:
             continue
-
-        try:
-            leave_start = datetime.strptime(leave["start_date"], "%Y-%m-%d").date()
-            leave_end = datetime.strptime(leave["end_date"], "%Y-%m-%d").date()
-        except Exception:
-            continue
-
+        leave_start = parse_date_safe(leave.get("start_date"), start_date)
+        leave_end = parse_date_safe(leave.get("end_date"), leave_start)
         current = leave_start
         while current <= leave_end:
             leave_map.setdefault(emp_id, set()).add(current)
             current += timedelta(days=1)
 
-    employees_by_id = {e.get("id"): e for e in employees}
+    team_map = build_team_map(teams, employees)
 
     generated_schedule = []
     shortages = []
     conflicts = []
     total_assignments = 0
+    employee_assignment_count = {}
 
     current_date = start_date
     while current_date <= end_date:
         day_assignments = []
         assigned_employee_ids = set()
+        team_daily_usage = {}
 
         for requirement in daily_staffing_requirements:
             department = requirement.get("department")
@@ -195,99 +254,69 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
             shift_type = requirement.get("shift_type", "normal")
             required_staff = int(requirement.get("required_staff", 0))
 
-            selected_employees = []
+            if required_staff <= 0:
+                continue
 
-            if rules["use_teams"]:
-                matching_teams = [
-                    team for team in teams
-                    if (team.get("department") or "").strip().lower() == (department or "").strip().lower()
-                    and bool(team.get("is_active", True))
-                ]
+            primary_candidates = []
+            secondary_candidates = []
 
-                team_candidates = []
-
-                for team in matching_teams:
-                    available_members = []
-
-                    for member_id in team.get("member_ids", []):
-                        employee = employees_by_id.get(member_id)
-                        if not employee:
-                            continue
-
-                        if member_id in assigned_employee_ids:
-                            continue
-
-                        matches, source_role_type = employee_matches_role(employee, department, role)
-                        if not matches:
-                            continue
-
-                        if not can_work(employee, current_date, rest_days_map, leave_map, rules):
-                            continue
-
-                        available_members.append((employee, source_role_type))
-
-                    available_members.sort(key=lambda item: 0 if item[1] == "main" else 1)
-
-                    if available_members:
-                        team_candidates.append((team, available_members))
-
-                team_candidates.sort(key=lambda item: len(item[1]), reverse=True)
-
-                for team, members in team_candidates:
-                    if len(selected_employees) >= required_staff:
-                        break
-
-                    remaining_needed = required_staff - len(selected_employees)
-
-                    if len(members) <= remaining_needed:
-                        for employee, _ in members:
-                            emp_id = employee.get("id")
-                            if emp_id not in assigned_employee_ids and emp_id not in [e.get("id") for e in selected_employees]:
-                                selected_employees.append(employee)
-                    else:
-                        if remaining_needed > 0:
-                            for employee, _ in members[:remaining_needed]:
-                                emp_id = employee.get("id")
-                                if emp_id not in assigned_employee_ids and emp_id not in [e.get("id") for e in selected_employees]:
-                                    selected_employees.append(employee)
-
-            if len(selected_employees) < required_staff:
-                matched_employees = []
-
-                for employee in employees:
-                    emp_id = employee.get("id")
-
-                    if emp_id in assigned_employee_ids:
-                        continue
-
-                    if emp_id in [e.get("id") for e in selected_employees]:
-                        continue
-
-                    if not can_work(employee, current_date, rest_days_map, leave_map, rules):
-                        continue
-
-                    matches, source_role_type = employee_matches_role(employee, department, role)
-                    if not matches:
-                        continue
-
-                    matched_employees.append((employee, source_role_type))
-
-                matched_employees.sort(key=lambda item: 0 if item[1] == "main" else 1)
-
-                remaining_needed = required_staff - len(selected_employees)
-                for employee, _ in matched_employees[:remaining_needed]:
-                    selected_employees.append(employee)
-
-            for employee in selected_employees[:required_staff]:
+            for employee in employees:
                 emp_id = employee.get("id")
+
+                if not emp_id:
+                    continue
+
+                if emp_id in assigned_employee_ids:
+                    continue
+
+                if current_date in leave_map.get(emp_id, set()):
+                    continue
+
+                if not is_employee_available(employee, current_date, rest_days_map):
+                    continue
+
+                matches, source_role_type = employee_matches_role(employee, department, role)
+                if not matches:
+                    continue
+
+                candidate = (employee, source_role_type)
+
+                if source_role_type == "main":
+                    primary_candidates.append(candidate)
+                elif source_role_type == "secondary":
+                    secondary_candidates.append(candidate)
+
+            selected = pick_best_candidates_for_requirement(
+                primary_candidates=primary_candidates,
+                secondary_candidates=secondary_candidates,
+                required_staff=required_staff,
+                team_daily_usage=team_daily_usage,
+                team_map=team_map,
+                employee_assignment_count=employee_assignment_count
+            )
+
+            for employee, source_role_type in selected:
+                emp_id = employee.get("id")
+                if emp_id in assigned_employee_ids:
+                    continue
+
                 assigned_employee_ids.add(emp_id)
                 total_assignments += 1
+                employee_assignment_count[emp_id] = employee_assignment_count.get(emp_id, 0) + 1
 
-                day_assignments.append(
-                    create_assignment(employee, department, role, shift_type, team_map)
-                )
+                day_assignments.append({
+                    "employee_id": emp_id,
+                    "employee_name": employee.get("full_name", ""),
+                    "department": department,
+                    "role": role,
+                    "shift_type": shift_type,
+                    "start_time": "09:00",
+                    "end_time": "18:00",
+                    "team_id": get_employee_team_id(employee, team_map)
+                })
 
-            assigned_count = min(len(selected_employees), required_staff)
+            assigned_count = len(selected)
+
             if assigned_count < required_staff:
                 shortages.append({
                     "date": current_date.strftime("%Y-%m-%d"),
