@@ -69,10 +69,10 @@ def employee_matches_role(employee, department, role):
         return False, None
 
     if not target_role:
-        return True, "main"
+        return True, "primary"
 
     if main_role == target_role:
-        return True, "main"
+        return True, "primary"
 
     if secondary_role == target_role:
         return True, "secondary"
@@ -106,56 +106,37 @@ def group_candidates_by_team(candidates, team_map):
     grouped = {}
     no_team = []
 
-    for employee, source_role_type in candidates:
+    for employee, role_source in candidates:
         team_id = get_employee_team_id(employee, team_map)
         if team_id:
-            grouped.setdefault(team_id, []).append((employee, source_role_type))
+            grouped.setdefault(team_id, []).append((employee, role_source))
         else:
-            no_team.append((employee, source_role_type))
+            no_team.append((employee, role_source))
 
     return grouped, no_team
 
 
-def sort_candidate_pool(candidate_pool, employee_assignment_count, last_assigned_day, current_date):
-    def score(item):
-        employee = item[0]
-        emp_id = employee.get("id")
-
-        total_assignments = employee_assignment_count.get(emp_id, 0)
-
-        last_day = last_assigned_day.get(emp_id)
-        recent_penalty = 0
-        if last_day:
-            days_diff = (current_date - last_day).days
-            if days_diff <= 1:
-                recent_penalty = 5
-            elif days_diff <= 2:
-                recent_penalty = 3
-
-        return (
-            0 if item[1] == "main" else 1,
-            total_assignments,
-            recent_penalty,
-            (employee.get("full_name") or "").strip().lower()
-        )
-
-    return sorted(candidate_pool, key=score)
+def sort_candidate_pool(candidate_pool, employee_assignment_counts):
+    return sorted(candidate_pool, key=lambda item: (
+        employee_assignment_counts.get(item[0].get("id"), 0),
+        0 if item[1] == "primary" else 1,
+        (item[0].get("full_name") or "").strip().lower(),
+        item[0].get("id") or ""
+    ))
 
 
 def pick_best_candidates_for_requirement(
     primary_candidates,
     secondary_candidates,
     required_staff,
-    team_daily_usage,
+    team_usage_count,
     team_map,
-    employee_assignment_count,
-    last_assigned_day,
-    current_date
+    employee_assignment_counts
 ):
     selected = []
 
-    primary_candidates = sort_candidate_pool(primary_candidates, employee_assignment_count, last_assigned_day, current_date)
-    secondary_candidates = sort_candidate_pool(secondary_candidates, employee_assignment_count, last_assigned_day, current_date)
+    primary_candidates = sort_candidate_pool(primary_candidates, employee_assignment_counts)
+    secondary_candidates = sort_candidate_pool(secondary_candidates, employee_assignment_counts)
 
     primary_by_team, primary_without_team = group_candidates_by_team(primary_candidates, team_map)
     secondary_by_team, secondary_without_team = group_candidates_by_team(secondary_candidates, team_map)
@@ -163,7 +144,7 @@ def pick_best_candidates_for_requirement(
     ordered_primary_teams = sorted(
         primary_by_team.items(),
         key=lambda item: (
-            team_daily_usage.get(item[0], 0),
+            team_usage_count.get(item[0], 0),
             -len(item[1]),
             item[0]
         )
@@ -172,27 +153,27 @@ def pick_best_candidates_for_requirement(
     for team_id, members in ordered_primary_teams:
         if len(selected) >= required_staff:
             break
-        for employee, source_role_type in members:
+        for employee, role_source in members:
             if len(selected) >= required_staff:
                 break
             if any(existing[0].get("id") == employee.get("id") for existing in selected):
                 continue
-            selected.append((employee, source_role_type))
-            team_daily_usage[team_id] = team_daily_usage.get(team_id, 0) + 1
+            selected.append((employee, role_source))
+            team_usage_count[team_id] = team_usage_count.get(team_id, 0) + 1
 
     if len(selected) < required_staff:
-        for employee, source_role_type in primary_without_team:
+        for employee, role_source in primary_without_team:
             if len(selected) >= required_staff:
                 break
             if any(existing[0].get("id") == employee.get("id") for existing in selected):
                 continue
-            selected.append((employee, source_role_type))
+            selected.append((employee, role_source))
 
     if len(selected) < required_staff:
         ordered_secondary_teams = sorted(
             secondary_by_team.items(),
             key=lambda item: (
-                team_daily_usage.get(item[0], 0),
+                team_usage_count.get(item[0], 0),
                 -len(item[1]),
                 item[0]
             )
@@ -201,21 +182,21 @@ def pick_best_candidates_for_requirement(
         for team_id, members in ordered_secondary_teams:
             if len(selected) >= required_staff:
                 break
-            for employee, source_role_type in members:
+            for employee, role_source in members:
                 if len(selected) >= required_staff:
                     break
                 if any(existing[0].get("id") == employee.get("id") for existing in selected):
                     continue
-                selected.append((employee, source_role_type))
-                team_daily_usage[team_id] = team_daily_usage.get(team_id, 0) + 1
+                selected.append((employee, role_source))
+                team_usage_count[team_id] = team_usage_count.get(team_id, 0) + 1
 
     if len(selected) < required_staff:
-        for employee, source_role_type in secondary_without_team:
+        for employee, role_source in secondary_without_team:
             if len(selected) >= required_staff:
                 break
             if any(existing[0].get("id") == employee.get("id") for existing in selected):
                 continue
-            selected.append((employee, source_role_type))
+            selected.append((employee, role_source))
 
     return selected[:required_staff]
 
@@ -259,14 +240,15 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
     shortages = []
     conflicts = []
     total_assignments = 0
-    employee_assignment_count = {}
-    last_assigned_day = {}
+    team_usage_count = {}
+    employee_assignment_counts = {}
+    employee_name_map = {employee.get("id"): employee.get("full_name", "") for employee in employees}
+    secondary_role_assignments_count = 0
 
     current_date = start_date
     while current_date <= end_date:
         day_assignments = []
         assigned_employee_ids = set()
-        team_daily_usage = {}
 
         for requirement in daily_staffing_requirements:
             department = requirement.get("department")
@@ -295,57 +277,75 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
                 if not is_employee_available(employee, current_date, rest_days_map):
                     continue
 
-                matches, source_role_type = employee_matches_role(employee, department, role)
+                matches, role_source = employee_matches_role(employee, department, role)
                 if not matches:
                     continue
 
-                candidate = (employee, source_role_type)
+                candidate = (employee, role_source)
 
-                if source_role_type == "main":
+                if role_source == "primary":
                     primary_candidates.append(candidate)
-                elif source_role_type == "secondary":
+                elif role_source == "secondary":
                     secondary_candidates.append(candidate)
 
             selected = pick_best_candidates_for_requirement(
-                primary_candidates,
-                secondary_candidates,
-                required_staff,
-                team_daily_usage,
-                team_map,
-                employee_assignment_count,
-                last_assigned_day,
-                current_date
+                primary_candidates=primary_candidates,
+                secondary_candidates=secondary_candidates,
+                required_staff=required_staff,
+                team_usage_count=team_usage_count,
+                team_map=team_map,
+                employee_assignment_counts=employee_assignment_counts
             )
 
-            for employee, source_role_type in selected:
+            for employee, role_source in selected:
                 emp_id = employee.get("id")
                 if emp_id in assigned_employee_ids:
                     continue
 
                 assigned_employee_ids.add(emp_id)
                 total_assignments += 1
-                employee_assignment_count[emp_id] = employee_assignment_count.get(emp_id, 0) + 1
-                last_assigned_day[emp_id] = current_date
+                employee_assignment_counts[emp_id] = employee_assignment_counts.get(emp_id, 0) + 1
+
+                if role_source == "secondary":
+                    secondary_role_assignments_count += 1
 
                 day_assignments.append({
                     "employee_id": emp_id,
                     "employee_name": employee.get("full_name", ""),
                     "department": department,
                     "role": role,
+                    "role_source": role_source,
                     "shift_type": shift_type,
                     "start_time": "09:00",
                     "end_time": "18:00",
                     "team_id": get_employee_team_id(employee, team_map)
                 })
 
-            if len(selected) < required_staff:
+            assigned_count = len(selected)
+
+            if assigned_count < required_staff:
+                total_compatible = len(primary_candidates) + len(secondary_candidates)
+                primary_count = len(primary_candidates)
+                secondary_count = len(secondary_candidates)
+
+                if total_compatible == 0:
+                    reason = "Nu există angajați compatibili disponibili"
+                elif primary_count == 0 and secondary_count > 0:
+                    reason = f"Disponibili doar pe rol secundar: {secondary_count}, alocați: {assigned_count}"
+                else:
+                    reason = (
+                        f"Disponibili compatibili: {total_compatible}, "
+                        f"principal: {primary_count}, secundar: {secondary_count}, "
+                        f"alocați: {assigned_count}"
+                    )
+
                 shortages.append({
                     "date": current_date.strftime("%Y-%m-%d"),
                     "department": department,
                     "role": role,
-                    "required": required_staff,
-                    "assigned": len(selected),
-                    "missing": required_staff - len(selected)
+                    "shift_type": shift_type,
+                    "missing_count": required_staff - assigned_count,
+                    "reason": reason
                 })
 
         generated_schedule.append({
@@ -355,6 +355,18 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
 
         current_date += timedelta(days=1)
 
+    employees_overused = sorted(
+        [
+            {
+                "employee_id": emp_id,
+                "employee_name": employee_name_map.get(emp_id, ""),
+                "assignment_count": assignment_count
+            }
+            for emp_id, assignment_count in employee_assignment_counts.items()
+        ],
+        key=lambda item: (-item["assignment_count"], item["employee_name"], item["employee_id"])
+    )
+
     return {
         "generated_schedule": generated_schedule,
         "conflicts": conflicts,
@@ -363,6 +375,9 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
             "total_days": len(generated_schedule),
             "total_assignments": total_assignments,
             "total_shortages": len(shortages),
-            "total_conflicts": len(conflicts)
+            "total_conflicts": len(conflicts),
+            "team_usage_count": team_usage_count,
+            "secondary_role_assignments_count": secondary_role_assignments_count,
+            "employees_overused": employees_overused
         }
     }
