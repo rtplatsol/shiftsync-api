@@ -7,11 +7,22 @@ API_KEY = "stoklyn-secret-key"
 
 
 def parse_pattern(pattern: str):
-    if not pattern or "/" not in pattern:
+    if not pattern:
         return None
+
+    pattern = str(pattern).strip().replace(" ", "")
+    if "/" not in pattern:
+        return None
+
     try:
         work_days, off_days = pattern.split("/")
-        return int(work_days), int(off_days)
+        work_days = int(work_days)
+        off_days = int(off_days)
+
+        if work_days < 0 or off_days < 0:
+            return None
+
+        return work_days, off_days
     except Exception:
         return None
 
@@ -35,14 +46,18 @@ def is_employee_available(employee, target_date, rest_days_map):
     if weekday in off_days:
         return False
 
+    if not weekly_pattern:
+        return True
+
     pattern = parse_pattern(weekly_pattern)
     if not pattern:
-        return True
+        return False
 
     work_days, off_days_count = pattern
     cycle = work_days + off_days_count
+
     if cycle <= 0:
-        return True
+        return False
 
     try:
         start_date = datetime.strptime(hire_date, "%Y-%m-%d").date()
@@ -50,6 +65,7 @@ def is_employee_available(employee, target_date, rest_days_map):
         start_date = datetime(2026, 1, 1).date()
 
     delta_days = (target_date - start_date).days
+
     if delta_days < 0:
         return False
 
