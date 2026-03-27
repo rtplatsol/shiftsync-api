@@ -116,13 +116,30 @@ def group_candidates_by_team(candidates, team_map):
     return grouped, no_team
 
 
-def sort_candidate_pool(candidate_pool, employee_assignment_count):
-    return sorted(candidate_pool, key=lambda item: (
-        0 if item[1] == "main" else 1,
-        employee_assignment_count.get(item[0].get("id"), 0),
-        (item[0].get("full_name") or "").strip().lower(),
-        item[0].get("id") or ""
-    ))
+def sort_candidate_pool(candidate_pool, employee_assignment_count, last_assigned_day, current_date):
+    def score(item):
+        employee = item[0]
+        emp_id = employee.get("id")
+
+        total_assignments = employee_assignment_count.get(emp_id, 0)
+
+        last_day = last_assigned_day.get(emp_id)
+        recent_penalty = 0
+        if last_day:
+            days_diff = (current_date - last_day).days
+            if days_diff <= 1:
+                recent_penalty = 5
+            elif days_diff <= 2:
+                recent_penalty = 3
+
+        return (
+            0 if item[1] == "main" else 1,
+            total_assignments,
+            recent_penalty,
+            (employee.get("full_name") or "").strip().lower()
+        )
+
+    return sorted(candidate_pool, key=score)
 
 
 def pick_best_candidates_for_requirement(
@@ -131,12 +148,14 @@ def pick_best_candidates_for_requirement(
     required_staff,
     team_daily_usage,
     team_map,
-    employee_assignment_count
+    employee_assignment_count,
+    last_assigned_day,
+    current_date
 ):
     selected = []
 
-    primary_candidates = sort_candidate_pool(primary_candidates, employee_assignment_count)
-    secondary_candidates = sort_candidate_pool(secondary_candidates, employee_assignment_count)
+    primary_candidates = sort_candidate_pool(primary_candidates, employee_assignment_count, last_assigned_day, current_date)
+    secondary_candidates = sort_candidate_pool(secondary_candidates, employee_assignment_count, last_assigned_day, current_date)
 
     primary_by_team, primary_without_team = group_candidates_by_team(primary_candidates, team_map)
     secondary_by_team, secondary_without_team = group_candidates_by_team(secondary_candidates, team_map)
@@ -241,6 +260,7 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
     conflicts = []
     total_assignments = 0
     employee_assignment_count = {}
+    last_assigned_day = {}
 
     current_date = start_date
     while current_date <= end_date:
@@ -287,12 +307,14 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
                     secondary_candidates.append(candidate)
 
             selected = pick_best_candidates_for_requirement(
-                primary_candidates=primary_candidates,
-                secondary_candidates=secondary_candidates,
-                required_staff=required_staff,
-                team_daily_usage=team_daily_usage,
-                team_map=team_map,
-                employee_assignment_count=employee_assignment_count
+                primary_candidates,
+                secondary_candidates,
+                required_staff,
+                team_daily_usage,
+                team_map,
+                employee_assignment_count,
+                last_assigned_day,
+                current_date
             )
 
             for employee, source_role_type in selected:
@@ -303,6 +325,7 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
                 assigned_employee_ids.add(emp_id)
                 total_assignments += 1
                 employee_assignment_count[emp_id] = employee_assignment_count.get(emp_id, 0) + 1
+                last_assigned_day[emp_id] = current_date
 
                 day_assignments.append({
                     "employee_id": emp_id,
@@ -315,16 +338,14 @@ def generate_schedule(data: dict, x_api_key: str = Header(None)):
                     "team_id": get_employee_team_id(employee, team_map)
                 })
 
-            assigned_count = len(selected)
-
-            if assigned_count < required_staff:
+            if len(selected) < required_staff:
                 shortages.append({
                     "date": current_date.strftime("%Y-%m-%d"),
                     "department": department,
                     "role": role,
                     "required": required_staff,
-                    "assigned": assigned_count,
-                    "missing": required_staff - assigned_count
+                    "assigned": len(selected),
+                    "missing": required_staff - len(selected)
                 })
 
         generated_schedule.append({
