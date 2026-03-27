@@ -15,7 +15,7 @@ def parse_pattern(pattern: str):
         return None
 
     try:
-        work_days, off_days = pattern.split("/")
+        work_days, off_days = pattern.split("/", 1)
         work_days = int(work_days)
         off_days = int(off_days)
 
@@ -29,18 +29,45 @@ def parse_pattern(pattern: str):
 
 def parse_date_safe(value, default_date):
     try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
     except Exception:
         return default_date
+
+
+def normalize_off_days(off_days):
+    normalized = set()
+
+    if not isinstance(off_days, list):
+        return normalized
+
+    for day in off_days:
+        try:
+            value = int(day)
+            if 0 <= value <= 6:
+                normalized.add(value)
+        except Exception:
+            continue
+
+    return normalized
+
+
+def get_pattern_start_date(employee):
+    fallback = datetime(2026, 1, 1).date()
+
+    for field in ["pattern_start_date", "cycle_start_date", "hire_date"]:
+        value = employee.get(field)
+        if value:
+            return parse_date_safe(value, fallback)
+
+    return fallback
 
 
 def is_employee_available(employee, target_date, rest_days_map):
     employee_id = employee.get("id")
     weekly_pattern = (employee.get("weekly_pattern") or "").strip()
-    hire_date = employee.get("hire_date") or "2026-01-01"
 
     rest_info = rest_days_map.get(employee_id, {})
-    off_days = rest_info.get("off_days", [])
+    off_days = normalize_off_days(rest_info.get("off_days", []))
 
     weekday = target_date.weekday()
     if weekday in off_days:
@@ -59,11 +86,7 @@ def is_employee_available(employee, target_date, rest_days_map):
     if cycle <= 0:
         return False
 
-    try:
-        start_date = datetime.strptime(hire_date, "%Y-%m-%d").date()
-    except Exception:
-        start_date = datetime(2026, 1, 1).date()
-
+    start_date = get_pattern_start_date(employee)
     delta_days = (target_date - start_date).days
 
     if delta_days < 0:
